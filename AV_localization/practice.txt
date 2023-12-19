@@ -1,0 +1,48 @@
+# avs_ms3_train
+    # Model
+    model = AVSModel.Pred_endecoder(channel=256, \
+                                        config=cfg, \
+                                        tpavi_stages=args.tpavi_stages, \
+                                        tpavi_vv_flag=args.tpavi_vv_flag, \
+                                        tpavi_va_flag=args.tpavi_va_flag)
+    model = torch.nn.DataParallel(model).cuda()
+    model.train()
+    logger.info("==> Total params: %.2fM" % ( sum(p.numel() for p in model.parameters()) / 1e6))
+
+    # video backbone
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    audio_backbone = audio_extractor(cfg, device)
+    audio_backbone.cuda()
+    audio_backbone.eval()
+
+    # Data
+    train_dataset = MS3Dataset('train')
+    train_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                        batch_size=args.train_batch_size,
+                                                        shuffle=True,
+                                                        num_workers=args.num_workers,
+                                                        pin_memory=True)
+
+    # Optimizer
+
+    # Train
+    for epoch in range(args.max_epoches):
+        for n_iter, batch_data in enumerate(train_dataloader):
+            imgs, audio, mask, _ = batch_data # [bs, 5, 3, 224, 224], [bs, 5, 1, 96, 64], [bs, 5 or 1, 1, 224, 224]
+
+            B, frame, C, H, W = imgs.shape
+            imgs = imgs.view(B*frame, C, H, W)
+            mask_num = 5
+            mask = mask.view(B*mask_num, 1, H, W)
+            audio = audio.view(-1, audio.shape[2], audio.shape[3], audio.shape[4]) # [B*T, 1, 96, 64]
+            with torch.no_grad():
+                audio_feature = audio_backbone(audio) # [B*T, 128]
+
+            output, v_map_list, a_fea_list = model(imgs, audio_feature) # output = [bs*5, 1, 224, 224]
+            loss, loss_dict = IouSemanticAwareLoss(output, mask, a_fea_list, v_map_list, \
+                                        sa_loss_flag=args.masked_av_flag, lambda_1=args.lambda_1, count_stages=args.masked_av_stages, \
+                                        mask_pooling_type=args.mask_pooling_type, threshold=args.threshold_flag, norm_fea=args.norm_fea_flag, \
+                                        closer_flag=args.closer_flag, euclidean_flag=args.euclidean_flag, kl_flag=args.kl_flag)
+
+===========================================================================================================================
+
