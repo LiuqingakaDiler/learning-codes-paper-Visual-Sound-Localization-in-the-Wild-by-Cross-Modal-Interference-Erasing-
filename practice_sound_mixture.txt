@@ -1,0 +1,331 @@
+############################################ Starts from clustering AV ###############################################
+class MUSIC_AV_Classify(object):
+
+    def __init__(self, video_dirs, aud_dirs, label, opt):
+        self.opt = opt
+        self.video_dirs = video_dirs
+        self.aud_dirs = aud_dirs
+        self.label = label
+        if self.opt.mode == 'val' or self.opt.mode == 'test':
+            img_transform_list = [transforms.Resize((224, 224)), transforms.ToTensor(),
+                                  transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))]
+        else:
+            img_transform_list = [transforms.Resize((256, 256)), transforms.RandomCrop(224), transforms.ToTensor(),
+                                  transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))]
+        self.img_transform = transforms.Compose(img_transform_list)
+
+    def __len__(self):
+        return len(self.video_dirs)
+
+    def __getitem__(self, index):
+        video_segment_img = random.choice(os.listdir(self.video_dirs[index]))
+        img_path = os.path.join(self.video_dirs[index], video_segment_img)
+
+        img = Image.open(img_path)
+        if (self.opt.enable_img_augmentation and self.opt.mode == 'train'):
+            img = augment_image(img)
+        img_data = self.img_transform(img)
+
+        with open(self.aud_dirs[index], 'rb') as fid:
+            cur_audio_data = pickle.load(fid)
+        audio_data = np.expand_dims(cur_audio_data, 0)
+
+        if self.opt.mode == 'val' or self.opt.mode == 'test':
+            return audio_data, img_data
+        else:
+            return audio_data, img_data, self.label[index]
+
+
+def class_model_train(model, data_loader, optimizer, criterion, args):
+    model.v_class_layer = torch.nn.Linear(512, args.cluster)
+    model.v_class_layer.weight.data.normal_(0, 0.01)
+    model.v_class_layer.bias.data.zero_()
+    model.v_class_layer.cuda()
+
+    model.a_class_layer = torch.nn.Linear(512, args.cluster)
+    model.a_class_layer.weight.data.normal_(0, 0.01)
+    model.a_class_layer.bias.data.zero_()
+    model.a_class_layer.cuda()
+
+    model.train()
+
+    params = list(model.v_class_layer.parameters()) + list(model.a_class_layer.parameters())
+    optimizer_cl = torch.optim.Adam(params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.0001)
+
+    for j in range(args.class_iter):
+        count = 0
+        losses = 0
+
+        a_count_ = 0
+        v_count_ = 0
+        count_ = 0
+        for i, data in enumerate(data_loader, 0):
+            aud, img, label = data
+            img, aud, label = img.type(torch.FloatTensor).cuda(), \
+                              aud.type(torch.FloatTensor).cuda(), \
+                              label.type(torch.LongTensor).cuda()
+
+            _, _, _, _, v_logits, a_logits = model(img, aud)
+            loss_v = criterion(v_logits, label)
+            loss_a = criterion(a_logits, label)
+            loss = loss_a + loss_v
+
+            optimizer.zero_grad()
+            optimizer_cl.zero_grad()
+            loss.backward()
+            optimizer.step()
+            optimizer_cl.step()
+
+            losses += loss.detach().cpu().numpy()
+            count += 1
+
+            label = label.cpu().numpy()
+            v_logits = np.argmax(v_logits.detach().cpu().numpy(), axis=1)
+            a_logits = np.argmax(a_logits.detach().cpu().numpy(), axis=1)
+
+            v_count_ += np.sum(v_logits == label)  # label_[:, -1])
+            a_count_ += np.sum(a_logits == label)  # label_[:, -1])
+            count_ += label.shape[0]
+
+        print('class loss is %.3f ' % (losses / count))
+        print('train_class: audio acc: %.3f, image acc: %.3f' % ((a_count_ / count_), (v_count_ / count_)))
+
+
+
+def extract_feature(model, data_loader, mask=0.05):
+    print('extracting features...')
+    model.eval()
+    accs = 0
+    num = len(data_loader.dataset)
+    count = 0
+    obj_features = []
+    img_features = []
+    aud_features = []
+    obj_labels = []
+    img_dirs = []
+    aud_dirs = []
+    with torch.no_grad():
+        for i, data in enumerate(data_loader, 0):
+            audio_data, posi_img_data, nega_img_data, posi_label, nega_label, posi_img_dir, posi_aud_dir = data
+
+            audio_data, image_data = audio_data.type(torch.FloatTensor).cuda(), \
+                                     posi_img_data.type(torch.FloatTensor).cuda()
+            #               B*C*H*W   B*C
+            _, location_map, v_fea, a_fea, _, _ = model(image_data, audio_data)  
+
+            location_map = location_map.detach().cpu().numpy()
+            v_fea = v_fea.detach().cpu().numpy()
+            a_fea = a_fea.detach().cpu().numpy()
+
+            for j in range(location_map.shape[0]):
+                obj_mask = np.uint8(location_map[j] > mask)
+                obj_mask = location_dilation(obj_mask)
+
+                img_rep = v_fea[j, :, :, :]  # such as 512 x 14 x 14  C*H*W
+                obj_rep = img_rep * obj_mask # Black-white            
+            ######################################################
+                obj_features.append(np.mean(obj_rep, (1,2)))
+                img_features.append(np.mean(img_rep, (1,2)))
+                aud_features.append(a_fea[j,:])
+                obj_labels.append(posi_label[j].numpy())   ########
+
+            img_dirs.extend(list(posi_img_dir))
+            aud_dirs.extend(list(posi_aud_dir))
+
+    return np.asarray(obj_features), np.asarray(img_features), np.asarray(aud_features),  np.asarray(obj_labels), img_dirs, aud_dirs
+
+
+def feature_clustering(data, label, val_data, clusters):
+    data = normalize(data, norm='l2')
+    val_data = normalize(val_data, norm='l2')
+    labels = []
+    for i in range(label.shape[0]):
+        if label[i] not in labels:
+            labels.append(label[i])
+    count = clusters
+    #print(count)
+    kmeans = cluster.KMeans(n_clusters=count, algorithm='full').fit(data)
+    cluster_label = kmeans.labels_
+    score = metrics.normalized_mutual_info_score(label, cluster_label)
+    val_label = kmeans.predict(val_data)
+
+    return cluster_label, score, val_label
+
+def main():
+
+    train_list_file = os.path.join(args.data_list_dir, 'solo_training_1.txt')
+    val_list_file = os.path.join(args.data_list_dir, 'solo_pairs_val.txt')
+    test_list_file = os.path.join(args.data_list_dir, 'solo_pairs_test.txt')
+
+    train_dataset = MUSIC_Dataset(args.data_dir, train_list_file, args)
+    val_dataset = MUSIC_Dataset(args.data_dir, val_list_file, args)
+    test_dataset = MUSIC_Dataset(args.data_dir, test_list_file, args)
+
+    train_dataloader = DataLoader(dataset=train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_threads)
+    val_dataloader = DataLoader(dataset=val_dataset, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_threads)
+    test_dataloader = DataLoader(dataset=test_dataset, batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_threads)
+
+
+    # net setup
+    visual_backbone = resnet18(modal='vision', pretrained=True)
+    audio_backbone  = resnet18(modal='audio')
+    av_model = Location_Net_stage_one(visual_net=visual_backbone, audio_net=audio_backbone, cluster=args.cluster)
+
+    av_model_cuda = av_model.cuda()
+
+    loss_func_BCE_location = torch.nn.BCELoss(reduce=True)
+    loss_func_BCE_class = torch.nn.CrossEntropyLoss()  # torch.nn.BCELoss(reduce=True)
+
+    params = list(av_model_cuda.parameters())
+    optimizer_location = optim.Adam(params=params[:-4], lr=args.learning_rate, betas=(0.9, 0.999),
+                           weight_decay=0.0001)
+ 
+    init_num = 0
+
+    for e in range(args.epoch):
+
+        ############################### location training #################################
+        print('Epoch is %03d' % e)
+        train_location_acc = location_model_train(av_model_cuda, train_dataloader, optimizer_location, loss_func_BCE_location)
+        eva_location_acc = location_model_eva(av_model_cuda, val_dataloader)
+
+        print('train acc is %.3f, val acc is %.3f' % (train_location_acc, eva_location_acc))
+        init_num += 1
+        if e % 1 == 0:
+            ee = e
+            PATH = 'ckpt/stage_one_%.2f_%d/location_cluster_net_%03d_%.3f_av_local.pth' % (args.mask, args.cluster, ee, eva_location_acc)
+            torch.save(av_model_cuda.state_dict(), PATH)
+
+        ############################### classification training #################################
+        if init_num > args.init_num and args.use_class_task:
+
+            obj_features, img_features, aud_features, labels, img_dirs, aud_dirs = extract_feature(av_model_cuda, train_dataloader, args.mask)
+            val_obj_features, val_img_features, val_aud_features, val_labels, val_img_dirs, val_aud_dirs = extract_feature(av_model_cuda, val_dataloader, args.mask)
+
+            obj_features_ = normalize(obj_features, norm='l2')
+            aud_features_ = normalize(aud_features, norm='l2')
+            av_features = np.concatenate((obj_features_, aud_features_), axis=1)
+
+            val_obj_features_ = normalize(val_obj_features, norm='l2')
+            val_aud_features_ = normalize(val_aud_features, norm='l2')
+            val_av_features = np.concatenate((val_obj_features_, val_aud_features_), axis=1)
+
+################################################# Clustering AVs #########################################################
+            pseudo_label, nmi_score, val_pseudo_label = feature_clustering(obj_features, labels, val_obj_features, args.cluster)
+            print('obj_NMI is %.3f' % nmi_score)
+
+            obj_fea = []
+            for i in range(args.cluster):
+                cur_idx = pseudo_label == i
+                cur_fea = obj_features[cur_idx]
+                obj_fea.append(np.mean(cur_fea, 0))
+            ee = e
+            np.save('obj_features_%.2f_%d/obj_feature_softmax_avg_fc_epoch_%d_av_entire.npy' % (args.mask, args.cluster, ee), obj_fea)
+
+            cluster_dict = {}
+            cluster_dict['pseudo_label'] = pseudo_label
+            cluster_dict['gt_labels'] = labels
+            cluster_ptr = open('obj_features_%.2f_%d/cluster_%d.pkl' % (args.mask, args.cluster, ee), 'wb')
+            pickle.dump(cluster_dict, cluster_ptr)
+       #########################################################################################
+
+            # Maybe pseudo-label guided classification task, as generalized categorization could benefit object localization
+            class_dataset = MUSIC_AV_Classify(img_dirs, aud_dirs, pseudo_label, args)
+            class_dataloader = DataLoader(dataset=class_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_threads)
+            class_dataset_val = MUSIC_AV_Classify(val_img_dirs, val_aud_dirs, val_pseudo_label, args)
+            class_dataloader_val = DataLoader(dataset=class_dataset_val, batch_size=args.batch_size, shuffle=False,
+                                              num_workers=args.num_threads)
+
+            class_model_train(av_model_cuda, class_dataloader, optimizer_location, loss_func_BCE_class, args)
+            class_model_val(av_model_cuda, class_dataloader_val)
+
+            if e % 1 == 0:
+                ee = e
+                PATH = 'ckpt/stage_one_%.2f_%d/location_cluster_net_iter_%03d_av_class.pth' % (args.mask, args.cluster, ee)
+                torch.save(av_model_cuda.state_dict(), PATH)
+
+================================================ I am a boring seperation line ==========================================
+
+################################################ Then go with mix sounds ################################################
+class MUSICMixDataset(BaseDataset):
+    def __init__(self, list_sample, opt, #pseudo_label,# **kwargs):
+        super(MUSICMixDataset, self).__init__(
+            list_sample, opt, **kwargs)
+        self.fps = opt.frameRate
+        self.num_mix = opt.num_mix
+		self.label = pseudo_label
+
+    def __getitem__(self, index):
+        N = self.num_mix
+        frames = [None for n in range(N)]
+        audios = [None for n in range(N)]
+        infos = [[] for n in range(N)]
+        # labels = [[] for n in range(N)]
+        path_frames = [[] for n in range(N)]
+        path_audios = ['' for n in range(N)]
+        center_frames = [0 for n in range(N)]
+
+        # the first video
+        infos[0] = self.list_sample[index]
+        # label for the first video
+		# labels[0] = self.label[index]
+
+        # sample other videos
+        if not self.split == 'train':
+            random.seed(index)
+        for n in range(1, N): # 1 -> N-1
+            indexN = random.randint(0, len(self.list_sample)-1)
+            infos[n] = self.list_sample[indexN]
+		    # label for the other N videos
+            # labels[n] = self.label[indexN]
+
+        # select frames
+        idx_margin = max(
+            int(self.fps * 8), (self.num_frames // 2) * self.stride_frames)
+        for n, infoN in enumerate(infos):
+            path_audioN, path_frameN, count_framesN = infoN
+
+            if self.split == 'train':
+                # random, not to sample start and end n-frames
+                center_frameN = random.randint(
+                    idx_margin+1, int(count_framesN)-idx_margin)
+            else:
+                center_frameN = int(count_framesN) // 2
+            center_frames[n] = center_frameN
+
+            # absolute frame/audio paths
+            for i in range(self.num_frames):
+                idx_offset = (i - self.num_frames // 2) * self.stride_frames
+                path_frames[n].append(
+                    os.path.join(
+                        path_frameN,
+                        '{:06d}.jpg'.format(center_frameN + idx_offset)))
+            path_audios[n] = path_audioN
+
+        # load frames and audios, STFT
+        try:
+            for n, infoN in enumerate(infos):
+                frames[n] = self._load_frames(path_frames[n])
+                # jitter audio
+                # center_timeN = (center_frames[n] - random.random()) / self.fps
+                center_timeN = (center_frames[n] - 0.5) / self.fps
+                audios[n] = self._load_audio(path_audios[n], center_timeN)
+            mag_mix, mags, phase_mix = self._mix_n_and_stft(audios)
+
+        except Exception as e:
+            print('Failed loading frame/audio: {}'.format(e))
+            # create dummy data
+            mag_mix, mags, frames, audios, phase_mix = \
+                self.dummy_mix_data(N)
+################# sound_mixture (aij), one_center_frame_for_each_sound, each_individual_sound_mag_list #,eeach_individual_sound_label_list (yij)#
+        ret_dict = {'mag_mix': mag_mix, 'frames': frames, 'mags': mags #, 'label': labels#}
+        if self.split != 'train':
+            ret_dict['audios'] = audios
+            ret_dict['phase_mix'] = phase_mix
+            ret_dict['infos'] = infos
+
+        return ret_dict
+
