@@ -145,7 +145,7 @@ def feature_clustering(data, label, val_data, clusters):
     count = clusters
     #print(count)
     kmeans = cluster.KMeans(n_clusters=count, algorithm='full').fit(data)
-    cluster_label = kmeans.labels_
+    cluster_label = kmeans.labels_  # B 1d array list, for each record, assign label value range(0-10)
     score = metrics.normalized_mutual_info_score(label, cluster_label)
     val_label = kmeans.predict(val_data)
 
@@ -218,12 +218,16 @@ def main():
             print('obj_NMI is %.3f' % nmi_score)
 
             obj_fea = []
+			# aud_fea = []
             for i in range(args.cluster):
                 cur_idx = pseudo_label == i
                 cur_fea = obj_features[cur_idx]
+				# cur_a_fea = aud_features[cur_idx]
+				# aud_fea.append(np.mean(cur_a_fea, 0))
                 obj_fea.append(np.mean(cur_fea, 0))
             ee = e
             np.save('obj_features_%.2f_%d/obj_feature_softmax_avg_fc_epoch_%d_av_entire.npy' % (args.mask, args.cluster, ee), obj_fea)
+            # np.save('aud_features_%.2f_%d/aud_feature_softmax_avg_fc_epoch_%d_av_entire.npy' % (args.mask, args.cluster, ee), aud_fea)
 
             cluster_dict = {}
             cluster_dict['pseudo_label'] = pseudo_label
@@ -250,13 +254,18 @@ def main():
 ================================================ I am a boring seperation line ==========================================
 
 ################################################ Then go with mix sounds ################################################
-class MUSICMixDataset(BaseDataset):
+
+# # Preprocess pseudo_label for one-hot encoding
+# labels_scalar = torch.tensor(pseudo_label).to(torch.int64) 
+# labels_onehot = Fun.one_hot(labels_scalar, num_classes = 11) # B*11, each record is a list with only class-th 1, rest 0s
+
+class MUSICMixDataset(BaseDataset):      # A_label==V_label==pseudo_label
     def __init__(self, list_sample, opt, #pseudo_label,# **kwargs):
         super(MUSICMixDataset, self).__init__(
             list_sample, opt, **kwargs)
         self.fps = opt.frameRate
         self.num_mix = opt.num_mix
-		self.label = pseudo_label
+		self.label = pseudo_label # B
 
     def __getitem__(self, index):
         N = self.num_mix
@@ -279,8 +288,12 @@ class MUSICMixDataset(BaseDataset):
         for n in range(1, N): # 1 -> N-1
             indexN = random.randint(0, len(self.list_sample)-1)
             infos[n] = self.list_sample[indexN]
-		    # label for the other N videos
+		    # label for the other N-1 videos
             # labels[n] = self.label[indexN]
+
+        label_mixture = []
+        for n in range(N):
+		    label_mixture += labels[n]  # ideally, label_mixture (B*K): [1,1,0,0,0,0,0,0,0,0,0] if index=0 and indexN=1
 
         # select frames
         idx_margin = max(
@@ -320,8 +333,9 @@ class MUSICMixDataset(BaseDataset):
             # create dummy data
             mag_mix, mags, frames, audios, phase_mix = \
                 self.dummy_mix_data(N)
-################# sound_mixture (aij), one_center_frame_for_each_sound, each_individual_sound_mag_list #,eeach_individual_sound_label_list (yij)#
-        ret_dict = {'mag_mix': mag_mix, 'frames': frames, 'mags': mags #, 'label': labels#}
+################# sound_mixture (aij), one_center_frame_for_each_sound, each_individual_sound_mag_list #,each_individual_sound_label_list (yij)#
+        #'label' might not in correct format, list or single sum of A+B, need the next procedure code to be verified
+		ret_dict = {'mag_mix': mag_mix, 'frames': frames, 'mags': mags #, 'label': labels, 'label_mixture': label_mixture#}
         if self.split != 'train':
             ret_dict['audios'] = audios
             ret_dict['phase_mix'] = phase_mix

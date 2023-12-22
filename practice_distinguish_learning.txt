@@ -1,0 +1,353 @@
+######################################### Start with extractor pipeline ################################################
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
+                 base_width=64, dilation=1, norm_layer=None):
+        super(BasicBlock, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+class ResNet_modified_for_AII(nn.Module):
+
+    def __init__(self, block, layers, modal, num_classes=1000, zero_init_residual=False,
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None,
+                 norm_layer=None):
+        super(ResNet, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self._norm_layer = norm_layer
+
+        self.inplanes = 64
+        self.dilation = 1
+        if replace_stride_with_dilation is None:
+            # each element in the tuple indicates if we should replace
+            # the 2x2 stride with a dilated convolution instead
+            replace_stride_with_dilation = [False, False, False]
+        if len(replace_stride_with_dilation) != 3:
+            raise ValueError("replace_stride_with_dilation should be None "
+                             "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
+        self.modal = modal
+        self.groups = groups
+        self.base_width = width_per_group
+        self.conv1_a = nn.Conv2d(1, self.inplanes, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.bn1 = norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
+                                       dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
+                                       dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=1,
+                                       dilate=replace_stride_with_dilation[2])
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
+        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlock):
+                    nn.init.constant_(m.bn2.weight, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+                            self.base_width, previous_dilation, norm_layer))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, groups=self.groups,
+                                base_width=self.base_width, dilation=self.dilation,
+                                norm_layer=norm_layer))
+
+        return nn.Sequential(*layers)
+
+    def _forward_impl(self, x):
+        # See note [TorchScript super()]
+        if self.modal == 'audio':
+            x = self.conv1_a(x) # stride=2
+        else:
+            x = self.conv1(x)   # stride=2
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)     # stride=2
+						        
+        x = self.layer1(x)      # stride=1
+		# xmid = self.layer1(x)      # stride=1
+		# x = self.layer2(xmid)      # stride=2
+        x = self.layer2(x)      # stride=2
+        x = self.layer3(x)      # stride=2
+        x = self.layer4(x)      # stride=1
+
+        # return x, xmid
+        return x
+
+    def forward(self, x):
+        return self._forward_impl(x)
+
+
+def _resnet(arch, block, layers, pretrained, progress, modal, **kwargs):
+    model = ResNet(block, layers, modal, **kwargs)
+    if pretrained:
+        print('load pretrained res-18')
+        model.load_state_dict(torch.load('./resnet18-5c106cde.pth'), strict=False)
+    return model
+
+def resnet18(pretrained=False, progress=True, modal='vision',**kwargs):
+    r"""ResNet-18 model from
+    `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+        progress (bool): If True, displays a progress bar of the download to stderr
+    """
+    return _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, progress, modal, **kwargs)
+	
+
+=============================================== I am a boring seperation line ===========================================
+
+class Location_Net_stage_one_modified_for_AII(nn.Module):
+    def __init__(self, visual_net, audio_net):
+        super(Location_Net_stage_one, self).__init__()
+
+        # backbone net
+        self.visual_net = visual_net
+        self.audio_net = audio_net
+
+        # visual ops
+        self.conv_v_1 = nn.Conv2d(512, 128, kernel_size=1)
+        self.conv_v_2 = nn.Conv2d(128, 128, kernel_size=1)
+
+        # audio ops
+        self.pooling_a = nn.AdaptiveMaxPool2d((1, 1))
+        self.fc_a_1 = nn.Linear(512, 128)
+        self.fc_a_2 = nn.Linear(128, 128)
+		
+		# Linear layer for mid in AII
+		# self.fc_a_3 = nn.Linear(64, 512)  # ??? need more thoughts
+		# # self.fc_a_4 = nn.Linear(512, 11)
+		# # self.cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+		# self.conv_mixture = nn.Conv1d(11, 1, kernel_size=1, bias=False)
+		# self.max_pooling_mixture = nn.AdaptiveMaxPool1d(1)
+
+        # fusion ops
+        self.conv_av = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+        self.max_pooling_av = nn.AdaptiveMaxPool2d((1, 1))
+
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+        self.v_class_layer = nn.Linear(512, 11)
+        self.a_class_layer = nn.Linear(512, 11)
+        self.pooling_v = nn.AdaptiveAvgPool2d((1, 1))
+
+                                       # 11*C   (aud_repC = 512)
+    def forward(self, v_input, a_input #,aud_rep#): 
+        # visual pathway
+        v_fea = self.visual_net(v_input) # (C==512)
+        v = self.conv_v_1(v_fea)         # (C==128)
+        v = self.relu(v)
+        v = self.conv_v_2(v)
+        #v = self.relu(v)
+
+        # audio pathway
+        a = self.audio_net(a_input)     # B*C*201*64  [(BT)*C*201*64]  (C==512)
+		
+		# a, amid = self.audio_net(a_input)     # B*C*201*64  [(BT)*C*201*64]  (aC==512) (amidC==64)
+		# #fij = self.fc_a_4(a)                  # B*C*201*64  [(BT)*C*201*64]  (fijC==11)
+		# amid = self.pooling_a(amid)           # B*C*1*1     [(BT)*C*1*1]
+		# amid_fea = torch.flatten(amid, 1)     # B*C         [(BT)*C]
+		# # amid = self.fc_a_1(amid_fea)          # B*C         [(BT)*C]
+		# # amid = self.relu(amid)                # B*C         [(BT)*C]
+        # # amid = self.fc_a_2(amid)              # B*C         [(BT)*C]
+		# distin_step_for_mixture_amid = self.fc_a_3(amid_fea)  # B*512     [(BT)*512]
+		
+		a = self.pooling_a(a)           # B*C*1*1     [(BT)*C*1*1]
+        a_fea = torch.flatten(a, 1)     # B*C         [(BT)*C]
+        a = self.fc_a_1(a_fea)          # B*C         [(BT)*C]  (C==128)
+        a = self.relu(a)                # B*C         [(BT)*C]
+        a = self.fc_a_2(a)              # B*C         [(BT)*C]
+
+        # av location
+        a = torch.unsqueeze(torch.unsqueeze(a, -1), -1)
+        a = torch.nn.functional.normalize(a, dim=1)
+        v = torch.nn.functional.normalize(v, dim=1)
+		'''
+		To match the scale of binary supervision, we employ a single-layer 1 × 1
+		convolution followed with sigmoid activation to process the obtained cosine similarity
+		'''
+        av = torch.sum(torch.mul(v, a), 1, keepdim=True)   # mul(B*C*H*W), sum(B*1*H*W)    (C==128)
+		                                                   # mul([(BT)*C*H*W]), sum([(BT)*1*H*W])
+        av = self.conv_av(av)
+        av_map = self.sigmoid(av)
+        av_output = self.max_pooling_av(av_map)
+        av_output = torch.squeeze(av_output)
+		
+		# mid train
+		# #fij = self.pooling_a(fij)           # B*C*1*1     [(BT)*C*1*1]  (fijC==11)
+		# #fij = torch.flatten(fij, 1)     # B*11         [(BT)*C]
+		# # aud_rep = aud_rep.permute(1, 0)   # K*C -> C*K  (aud_repC = 512, K = 11)
+		# # according to paper, aud_rep(K*C 512), (distin_step_for_mixture_amid+a_fea)(B*C 512) 
+		# # torch.matmul: B*C x C*K -> B*K, torch.matmul((distin_step_for_mixture_amid+a_fea), aud_rep)
+		
+		# #? sim_a_prototype_dist_mixture = torch.sum(torch.matmul((distin_step_for_mixture_amid+fij), aud_rep), 1, keepdim=True)
+		# #sim_a_prototype_dist_mixture = torch.matmul((distin_step_for_mixture_amid+fij), aud_rep)
+		# #sim_a_prototype_dist_mixture = self.conv_mixture(sim_a_prototype_dist_mixture)
+		# #sim_a_prototype_dist_mixture_map = self.sigmoid(sim_a_prototype_dist_mixture)
+		# #sim_a_prototype_dist_mixture_map_output = self.max_pooling_mixture(sim_a_prototype_dist_mixture_map)
+		# #sim_a_prototype_dist_mixture_map_output = torch.squeeze(sim_a_prototype_dist_mixture) # formula 10 paper, sim(...)
+		# sim_a_prototype_dist_mixture_map_output = F.normalize((distin_step_for_mixture_amid+fij)) @ F.normalize(aud_rep).t() # B*K
+		# ### Maybe sim_a_prototype_dist_mixture_map_output need be Sigmod to constrain the range within (0, 1)
+
+        # classfication
+        v_cla = self.pooling_v(v_fea)
+        v_cla = torch.flatten(v_cla, 1)
+        v_logits = self.v_class_layer(v_cla)
+        a_logits = self.a_class_layer(a_fea)
+
+        # return av_output, av_map, v_fea, a_fea, amid_fea,v_logits, a_logits, distin_step_for_mixture_amid, sim_a_prototype_dist_mixture_map_output
+		return av_output, av_map, v_fea, a_fea, v_logits, a_logits
+		
+
+=============================================== I am a boring seperation line ===========================================
+
+# data_loader: for mixture sound
+# model: for stage one
+
+# loss_func_BCE_AII = torch.nn.CrossEntropyLoss()  # torch.nn.BCELoss(reduce=True)
+loss_func_BCE_AII = torch.nn.BCELoss(reduce=True)
+params = list(model.parameters())
+optimizer_AII = optim.Adam(params=params[:-4], lr=args.learning_rate, betas=(0.9, 0.999),
+                           weight_decay=0.0001)
+						   
+						  
+def class_model_train_modified_for_AII(model, data_loader, optimizer, criterion, #,aud_rep,# args):
+    model.v_class_layer = torch.nn.Linear(512, args.cluster)
+    model.v_class_layer.weight.data.normal_(0, 0.01)
+    model.v_class_layer.bias.data.zero_()
+    model.v_class_layer.cuda()
+
+    model.a_class_layer = torch.nn.Linear(512, args.cluster)
+    model.a_class_layer.weight.data.normal_(0, 0.01)
+    model.a_class_layer.bias.data.zero_()
+    model.a_class_layer.cuda()
+	
+    # model.fc_a_3 = torch.nn.Linear(64, 512)
+    # model.fc_a_3.weight.data.normal_(0, 0.01)
+    # model.fc_a_3.bias.data.zero_()
+    # model.fc_a_3.cuda()
+
+    model.train()
+
+    params = list(model.v_class_layer.parameters()) + list(model.a_class_layer.parameters()) #+ list(model.fc_a_3.parameters()#)
+    optimizer_cl = torch.optim.Adam(params, lr=1e-3, betas=(0.9, 0.999), weight_decay=0.0001)
+
+    for j in range(args.class_iter):
+        count = 0
+        losses = 0
+
+        a_count_ = 0
+        v_count_ = 0
+        count_ = 0
+        for i, data in enumerate(data_loader, 0):
+            aud, img, label #,label_mixture# = data  # label, B; label_mixture B*K 
+            img, aud, label = img.type(torch.FloatTensor).cuda(), \
+                              aud.type(torch.FloatTensor).cuda(), \
+                              label.type(torch.LongTensor).cuda()
+
+            av_output, av_map, v_fea, a_fea, amid_fea,v_logits, a_logits, distin_step_for_mixture_amid, sim_a_prototype_dist_mixture_map_output = model(img, aud #,aud_rep#)
+            loss_v = criterion(v_logits, label)  #B*11, B? for torch.nn.CrossEntropyLoss() 
+            loss_a = criterion(a_logits, label)
+            loss = loss_a + loss_v
+			
+			#Add BCE loss formula 10 paper
+			# # need to expand 'label_mixture' B to B*11, loss_AII(Lpm)
+			# loss_AII = criterion(sim_a_prototype_dist_mixture_map_output, label_mixture) #B*11?, B*11 or B, B for torch.nn.BCELoss(reduce=True)
+			# 
+			
+            optimizer.zero_grad()
+            optimizer_cl.zero_grad()
+            loss.backward()
+            optimizer.step()
+            optimizer_cl.step()
+
+            losses += loss.detach().cpu().numpy()
+            count += 1
+
+            label = label.cpu().numpy()
+            v_logits = np.argmax(v_logits.detach().cpu().numpy(), axis=1)
+            a_logits = np.argmax(a_logits.detach().cpu().numpy(), axis=1)
+
+            v_count_ += np.sum(v_logits == label)  # label_[:, -1])
+            a_count_ += np.sum(a_logits == label)  # label_[:, -1])
+            count_ += label.shape[0]
+
+        print('class loss is %.3f ' % (losses / count))
+        print('train_class: audio acc: %.3f, image acc: %.3f' % ((a_count_ / count_), (v_count_ / count_)))
